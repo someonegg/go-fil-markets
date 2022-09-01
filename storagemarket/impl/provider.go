@@ -334,6 +334,10 @@ func (p *Provider) Stop() error {
 // It will verify that the data in the passed io.Reader matches the expected piece
 // cid for the given deal or it will error
 func (p *Provider) ImportDataForDeal(ctx context.Context, propCid cid.Cid, data io.Reader) error {
+	if storagemarket.ExternalCarstore != "" {
+		return p.importCarToExternalStore(ctx, propCid, data)
+	}
+
 	// TODO: be able to check if we have enough disk space
 	var d storagemarket.MinerDeal
 	if err := p.deals.Get(propCid).Get(&d); err != nil {
@@ -405,7 +409,102 @@ func (p *Provider) ImportDataForDeal(ctx context.Context, propCid cid.Cid, data 
 
 	log.Debugw("will fire ProviderEventVerifiedData for imported file", "propCid", propCid)
 
-	return p.deals.Send(propCid, storagemarket.ProviderEventVerifiedData, tempfi.Path(), filestore.Path(""))
+	return p.deals.Send(propCid, storagemarket.ProviderEventVerifiedData, tempfi.Path(), filestore.Path(""), "")
+}
+
+func (p *Provider) importCarToExternalStore(ctx context.Context, propCid cid.Cid, data io.Reader) error {
+	var d storagemarket.MinerDeal
+	if err := p.deals.Get(propCid).Get(&d); err != nil {
+		return xerrors.Errorf("failed getting deal %s: %w", propCid, err)
+	}
+
+	verified := false
+	alreadyIn, externalCAR := storagemarket.CarInExternalStore(data)
+
+	defer func() {
+		if !alreadyIn && !verified {
+			os.Remove(externalCAR)
+		}
+	}()
+
+	if !alreadyIn {
+		externalCAR = storagemarket.ExternalCarstoreOffline + d.Proposal.PieceCID.String() + ".car"
+
+		log.Debugw("will copy imported CAR to external carstore", "propCid", propCid)
+
+		err := func(srcf io.Reader, dst string) error {
+			_, err := os.Stat(dst)
+			if err == nil { // existed
+				return nil
+			}
+			dstf, err := os.Create(dst)
+			if err != nil {
+				return err
+			}
+			buf := make([]byte, 1024*1024)
+			type onlyWriter struct{ io.Writer } // force buf
+			type onlyReader struct{ io.Reader }
+			_, err = io.CopyBuffer(onlyWriter{dstf}, onlyReader{srcf}, buf)
+			if err != nil {
+				dstf.Close()
+				return err
+			}
+			return dstf.Close()
+		}(data, externalCAR)
+		if err != nil {
+			return xerrors.Errorf("importing CAR to external carstore failed: %w", err)
+		}
+
+		log.Debugw("finished copying imported CAR to external carstore", "propCid", propCid)
+	}
+
+	carf, err := os.Open(externalCAR)
+	if err != nil {
+		return xerrors.Errorf("failed to open external CAR: %w", err)
+	}
+	defer carf.Close()
+
+	carfi, err := carf.Stat()
+	if err != nil {
+		return xerrors.Errorf("failed to stat external CAR: %w", err)
+	}
+	carSize := uint64(carfi.Size())
+
+	proofType, err := p.spn.GetProofType(ctx, p.actor, nil)
+	if err != nil {
+		return xerrors.Errorf("failed to determine proof type: %w", err)
+	}
+	log.Debugw("fetched proof type", "propCid", propCid)
+
+	pieceCid, err := generatePieceCommitment(proofType, carf, carSize)
+	if err != nil {
+		return xerrors.Errorf("failed to generate commP: %w", err)
+	}
+	log.Debugw("generated pieceCid for imported file", "propCid", propCid)
+
+	if carSizePadded := padreader.PaddedSize(carSize).Padded(); carSizePadded < d.Proposal.PieceSize {
+		// need to pad up!
+		rawPaddedCommp, err := commp.PadCommP(
+			// we know how long a pieceCid "hash" is, just blindly extract the trailing 32 bytes
+			pieceCid.Hash()[len(pieceCid.Hash())-32:],
+			uint64(carSizePadded),
+			uint64(d.Proposal.PieceSize),
+		)
+		if err != nil {
+			return err
+		}
+		pieceCid, _ = commcid.DataCommitmentV1ToCID(rawPaddedCommp)
+	}
+
+	// Verify CommP matches
+	if !pieceCid.Equals(d.Proposal.PieceCID) {
+		return xerrors.Errorf("given data does not match expected commP (got: %s, expected %s)", pieceCid, d.Proposal.PieceCID)
+	}
+
+	log.Debugw("will fire ProviderEventVerifiedData for imported file", "propCid", propCid)
+
+	verified = true
+	return p.deals.Send(propCid, storagemarket.ProviderEventVerifiedData, filestore.Path(""), filestore.Path(""), externalCAR)
 }
 
 func generatePieceCommitment(rt abi.RegisteredSealProof, rd io.Reader, pieceSize uint64) (cid.Cid, error) {

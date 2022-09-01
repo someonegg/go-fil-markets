@@ -96,9 +96,10 @@ var ProviderEvents = fsm.Events{
 		}),
 	fsm.Event(storagemarket.ProviderEventVerifiedData).
 		FromMany(storagemarket.StorageDealVerifyData, storagemarket.StorageDealWaitingForData).To(storagemarket.StorageDealReserveProviderFunds).
-		Action(func(deal *storagemarket.MinerDeal, path filestore.Path, metadataPath filestore.Path) error {
+		Action(func(deal *storagemarket.MinerDeal, path filestore.Path, metadataPath filestore.Path, externalCAR string) error {
 			deal.PiecePath = path
 			deal.MetadataPath = metadataPath
+			deal.ExternalCAR = externalCAR
 			return nil
 		}),
 	fsm.Event(storagemarket.ProviderEventFundingInitiated).
