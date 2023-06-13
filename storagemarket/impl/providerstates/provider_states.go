@@ -244,7 +244,21 @@ func VerifyData(ctx fsm.Context, environment ProviderDealEnvironment, deal stora
 		return ctx.Trigger(storagemarket.ProviderEventDataVerificationFailed, xerrors.Errorf("proposal CommP doesn't match calculated CommP"), filestore.Path(""), metadataPath)
 	}
 
-	return ctx.Trigger(storagemarket.ProviderEventVerifiedData, filestore.Path(""), metadataPath)
+	if storagemarket.ExternalCarstore != "" && deal.InboundCAR != "" {
+		externalCAR := storagemarket.ExternalCarstoreOnline + deal.Proposal.PieceCID.String() + ".car"
+
+		log.Debugw("will copy inbound CAR to external carstore", "propCid", deal.ProposalCid)
+
+		if err := storagemarket.CopyFile(deal.InboundCAR, externalCAR); err != nil {
+			return ctx.Trigger(storagemarket.ProviderEventDataVerificationFailed, xerrors.Errorf("copy CAR to external carstore failed: %w", err), filestore.Path(""), filestore.Path(""))
+		}
+
+		log.Debugw("finished copying inbound CAR to external carstore", "propCid", deal.ProposalCid)
+
+		return ctx.Trigger(storagemarket.ProviderEventVerifiedData, filestore.Path(""), metadataPath, externalCAR)
+	}
+
+	return ctx.Trigger(storagemarket.ProviderEventVerifiedData, filestore.Path(""), metadataPath, "")
 }
 
 // ReserveProviderFunds adds funds, as needed to the StorageMarketActor, so the miner has adequate collateral for the deal
@@ -333,7 +347,42 @@ func WaitForPublish(ctx fsm.Context, environment ProviderDealEnvironment, deal s
 func HandoffDeal(ctx fsm.Context, environment ProviderDealEnvironment, deal storagemarket.MinerDeal) error {
 	var packingInfo *storagemarket.PackingResult
 	var carFilePath string
-	if deal.PiecePath != "" {
+	if deal.ExternalCAR != "" {
+		info, err := func(car string) (*storagemarket.PackingResult, error) {
+			v2r, err := environment.ReadCAR(car)
+			if err != nil {
+				return nil, xerrors.Errorf("failed to open external CAR file, proposalCid=%s: %w", deal.ProposalCid, err)
+			}
+			defer v2r.Close()
+
+			payloadSize := v2r.Header.DataSize
+			if v2r.Version != 2 {
+				sz, err := storagemarket.FileSize(car)
+				if err != nil {
+					return nil, xerrors.Errorf("failed to stat external CAR file, proposalCid=%s: %w", deal.ProposalCid, err)
+				}
+				payloadSize = sz
+			}
+
+			// Hand the deal off to the process that adds it to a sector
+			log.Infow("handing off deal to sealing subsystem", "pieceCid", deal.Proposal.PieceCID, "proposalCid", deal.ProposalCid)
+			r, err := v2r.DataReader()
+			if err != nil {
+				return nil, xerrors.Errorf("failed to get reader over file data, proposalCid=%s: %w", deal.ProposalCid, err)
+			}
+			res, err := handoffDeal(ctx.Context(), environment, deal, r, payloadSize)
+			if err != nil {
+				return nil, xerrors.Errorf("packing piece %s: %w", deal.Ref.PieceCid, err)
+			}
+			return res, nil
+		}(deal.ExternalCAR)
+		if err != nil {
+			return ctx.Trigger(storagemarket.ProviderEventDealHandoffFailed, err)
+		}
+
+		packingInfo = info
+		carFilePath = deal.ExternalCAR
+	} else if deal.PiecePath != "" {
 		// Data for offline deals is stored on disk, so if PiecePath is set,
 		// create a Reader from the file path
 		file, err := environment.FileStore().Open(deal.PiecePath)

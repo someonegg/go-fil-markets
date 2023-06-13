@@ -730,7 +730,7 @@ func (t *MinerDeal) MarshalCBOR(w io.Writer) error {
 
 	cw := cbg.NewCborWriter(w)
 
-	if _, err := cw.Write([]byte{180}); err != nil {
+	if _, err := cw.Write([]byte{181}); err != nil {
 		return err
 	}
 
@@ -1113,6 +1113,29 @@ func (t *MinerDeal) MarshalCBOR(w io.Writer) error {
 	if _, err := io.WriteString(w, string(t.InboundCAR)); err != nil {
 		return err
 	}
+
+	// t.ExternalCAR (string) (string)
+	if len("ExternalCAR") > cbg.MaxLength {
+		return xerrors.Errorf("Value in field \"ExternalCAR\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("ExternalCAR"))); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, string("ExternalCAR")); err != nil {
+		return err
+	}
+
+	if len(t.ExternalCAR) > cbg.MaxLength {
+		return xerrors.Errorf("Value in field t.ExternalCAR was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(t.ExternalCAR))); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, string(t.ExternalCAR)); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1455,6 +1478,17 @@ func (t *MinerDeal) UnmarshalCBOR(r io.Reader) (err error) {
 				}
 
 				t.InboundCAR = string(sval)
+			}
+			// t.ExternalCAR (string) (string)
+		case "ExternalCAR":
+
+			{
+				sval, err := cbg.ReadString(cr)
+				if err != nil {
+					return err
+				}
+
+				t.ExternalCAR = string(sval)
 			}
 
 		default:
